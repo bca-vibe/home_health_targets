@@ -5,6 +5,7 @@ Uses providers_annual.csv and operators_annual.csv.
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
@@ -59,16 +60,22 @@ def _ownership_label(toc: str) -> str:
     return "Other"
 
 
+MEDICARE_REV_COL = "Gross Patient Revenues Title XVIII Medicare"
+MEDICARE_NET_REV_COL = "Net Patient Revenues (line 1 minus line 2) XVIII Medicare"
+MEDICAID_REV_COL = "Gross Patient Revenues Title XIX Medicaid"
+MEDICAID_NET_REV_COL = "Net Patient Revenues (line 1 minus line 2) XIX Medicaid"
+
+
 @st.cache_data
 def build_enriched_operators(
     operators: pd.DataFrame,
     providers: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Add revenue_growth_pct, net_income_margin_pct, ownership."""
+    """Add revenue_growth_pct, net_income_margin_pct, medicare_revenue_growth_pct, medicare_net_income_margin_pct, ownership."""
     rev_col = "Gross Patient Revenues Total"
     ni_col = "Net Income or Loss for the period (line 18 plus line 32)"
 
-    # Prior-year revenue
+    # Prior-year revenue (total)
     prior = operators[["operator_id", "year", rev_col]].copy()
     prior["year"] = prior["year"] + 1
     prior = prior.rename(columns={rev_col: "prior_year_revenue"})
@@ -84,12 +91,36 @@ def build_enriched_operators(
     )
     op = op.drop(columns=["prior_year_revenue"])
 
-    # Net income margin
+    # Prior-year Medicare revenue
+    prior_med = operators[["operator_id", "year", MEDICARE_REV_COL]].copy()
+    prior_med["year"] = prior_med["year"] + 1
+    prior_med = prior_med.rename(columns={MEDICARE_REV_COL: "prior_medicare_revenue"})
+    op = op.merge(prior_med, on=["operator_id", "year"], how="left")
+    op["prior_medicare_revenue"] = pd.to_numeric(op["prior_medicare_revenue"], errors="coerce")
+    op[MEDICARE_REV_COL] = pd.to_numeric(op[MEDICARE_REV_COL], errors="coerce")
+    op["medicare_revenue_growth_pct"] = None
+    mask_med = op["prior_medicare_revenue"].notna() & (op["prior_medicare_revenue"] > 0)
+    op.loc[mask_med, "medicare_revenue_growth_pct"] = (
+        (op.loc[mask_med, MEDICARE_REV_COL] - op.loc[mask_med, "prior_medicare_revenue"])
+        / op.loc[mask_med, "prior_medicare_revenue"]
+        * 100
+    )
+    op = op.drop(columns=["prior_medicare_revenue"])
+
+    # Net income margin (total)
     op[ni_col] = pd.to_numeric(op[ni_col], errors="coerce")
     op["net_income_margin_pct"] = None
     rev_pos = op[rev_col].notna() & (op[rev_col] > 0)
     op.loc[rev_pos, "net_income_margin_pct"] = (
         op.loc[rev_pos, ni_col] / op.loc[rev_pos, rev_col] * 100
+    )
+
+    # Medicare net income margin
+    op[MEDICARE_NET_REV_COL] = pd.to_numeric(op[MEDICARE_NET_REV_COL], errors="coerce")
+    op["medicare_net_income_margin_pct"] = None
+    med_rev_pos = op[MEDICARE_REV_COL].notna() & (op[MEDICARE_REV_COL] > 0)
+    op.loc[med_rev_pos, "medicare_net_income_margin_pct"] = (
+        op.loc[med_rev_pos, MEDICARE_NET_REV_COL] / op.loc[med_rev_pos, MEDICARE_REV_COL] * 100
     )
 
     # Ownership from providers: mode of Type of Control per (operator_id, year)
@@ -191,9 +222,62 @@ def format_currency(x) -> str:
     return f"${x:.2f}"
 
 
+def make_pareto_fig(
+    values: pd.Series,
+    value_label: str,
+    title: str,
+    value_scale: float = 1.0,
+    value_suffix: str = "",
+) -> go.Figure:
+    """Build a Pareto chart: bars (value, sorted desc) + cumulative % line."""
+    s = values.dropna()
+    s = s[s > 0] if value_scale != 1 else s
+    if len(s) == 0:
+        return None
+    s = s.sort_values(ascending=False).reset_index(drop=True)
+    s = s / value_scale
+    total = s.sum()
+    cum_pct = s.cumsum() / total * 100 if total else s * 0
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=s.index + 1, y=s.values, name=value_label, yaxis="y"))
+    fig.add_trace(
+        go.Scatter(
+            x=s.index + 1,
+            y=cum_pct.values,
+            name="Cumulative %",
+            yaxis="y2",
+            mode="lines+markers",
+            line={"dash": "dash", "color": "firebrick"},
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Rank (by value)",
+        yaxis=dict(title=f"{value_label} ({value_suffix})", side="left"),
+        yaxis2=dict(
+            title="Cumulative %",
+            side="right",
+            range=[0, 105],
+            overlaying="y",
+            tickformat=".0f",
+        ),
+        hovermode="x unified",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
 def main():
     st.set_page_config(page_title="HHA Dashboard", layout="wide")
     st.title("Home Health Agency Dashboard")
+
+    st.markdown(
+        "This dashboard is powered by data from the [CMS Home Health Agency Cost Report](https://data.cms.gov/provider-compliance/cost-reports/home-health-agency-cost-report) "
+        "for **2020 through 2023**. The financial data reflects what each provider reported to Medicare as part of the "
+        "requirements for Medicare participation. **Medicare revenue** data should generally be treated as trustworthy, "
+        "whereas other reported revenue and cost data is less likely to be audited and should be treated with greater caution."
+    )
 
     operators_raw = load_operators()
     providers_raw = load_providers()
@@ -269,21 +353,29 @@ def main():
             "operator_name",
             "state_codes",
             "cities",
+            "ownership",
             rev_col,
             ni_col,
             "net_income_margin_pct",
             "revenue_growth_pct",
-            "ownership",
+            MEDICARE_REV_COL,
+            MEDICARE_NET_REV_COL,
+            "medicare_net_income_margin_pct",
+            "medicare_revenue_growth_pct",
         ]
         table_df = table_df[display_cols].copy()
         table_df = table_df.rename(columns={
             "state_codes": "States",
             "cities": "Cities",
+            "ownership": "Type of control",
             rev_col: "Total revenue",
+            MEDICARE_REV_COL: "Medicare revenue",
+            MEDICARE_NET_REV_COL: "Medicare net income",
+            "medicare_net_income_margin_pct": "Medicare net income margin (%)",
+            "medicare_revenue_growth_pct": "Medicare revenue growth (%)",
             ni_col: "Net income",
             "net_income_margin_pct": "Net income margin (%)",
             "revenue_growth_pct": "Revenue growth (%)",
-            "ownership": "Type of control",
         })
         table_df["States"] = table_df["States"].str.replace("|", ", ", regex=False)
         st.dataframe(table_df, use_container_width=True, hide_index=True)
@@ -292,17 +384,29 @@ def main():
         st.subheader("Summary metrics")
         n_op = len(filtered)
         total_rev = pd.to_numeric(filtered[rev_col], errors="coerce").sum()
-        total_medicare = pd.to_numeric(filtered["Gross Patient Revenues Title XVIII Medicare"], errors="coerce").sum()
-        total_medicaid = pd.to_numeric(filtered["Gross Patient Revenues Title XIX Medicaid"], errors="coerce").sum()
+        total_medicare = pd.to_numeric(filtered[MEDICARE_REV_COL], errors="coerce").sum()
+        total_medicaid = pd.to_numeric(filtered[MEDICAID_REV_COL], errors="coerce").sum()
         margin_series = filtered["net_income_margin_pct"].dropna()
         avg_margin = margin_series.mean() if len(margin_series) else None
+        medicare_rev = pd.to_numeric(filtered[MEDICARE_REV_COL], errors="coerce")
+        medicare_net = pd.to_numeric(filtered[MEDICARE_NET_REV_COL], errors="coerce")
+        medicaid_rev = pd.to_numeric(filtered[MEDICAID_REV_COL], errors="coerce")
+        medicaid_net = pd.to_numeric(filtered[MEDICAID_NET_REV_COL], errors="coerce")
+        _medicare_margin = medicare_net / medicare_rev * 100
+        medicare_margin_series = _medicare_margin.where(np.isfinite(_medicare_margin))[(medicare_rev > 0)].dropna()
+        _medicaid_margin = medicaid_net / medicaid_rev * 100
+        medicaid_margin_series = _medicaid_margin.where(np.isfinite(_medicaid_margin))[(medicaid_rev > 0)].dropna()
+        avg_medicare_margin = medicare_margin_series.mean() if len(medicare_margin_series) else None
+        avg_medicaid_margin = medicaid_margin_series.mean() if len(medicaid_margin_series) else None
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
         c1.metric("Operators", f"{n_op:,}")
         c2.metric("Total revenue", format_currency(total_rev))
         c3.metric("Total Medicare revenue", format_currency(total_medicare))
         c4.metric("Total Medicaid revenue", format_currency(total_medicaid))
         c5.metric("Avg net income margin (%)", f"{avg_margin:.1f}%" if avg_margin is not None else "—")
+        c6.metric("Avg Medicare net income margin (%)", f"{avg_medicare_margin:.1f}%" if avg_medicare_margin is not None else "—")
+        c7.metric("Avg Medicaid net income margin (%)", f"{avg_medicaid_margin:.1f}%" if avg_medicaid_margin is not None else "—")
 
         st.subheader("Distributions")
         rev_numeric = pd.to_numeric(filtered[rev_col], errors="coerce").dropna()
@@ -311,9 +415,8 @@ def main():
         medicare_numeric = medicare_numeric[medicare_numeric > 0]
         medicaid_numeric = pd.to_numeric(filtered["Gross Patient Revenues Title XIX Medicaid"], errors="coerce").dropna()
         medicaid_numeric = medicaid_numeric[medicaid_numeric > 0]
-        margin_numeric = filtered["net_income_margin_pct"].dropna()
 
-        fig_col1, fig_col2 = st.columns(2)
+        fig_col1, fig_col2, fig_col3 = st.columns(3)
         with fig_col1:
             if len(rev_numeric):
                 fig = px.histogram(x=rev_numeric / 1e6, nbins=50, labels={"x": "Revenue ($M)"}, title="Revenue distribution")
@@ -326,20 +429,54 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No Medicare revenue data for selected filters.")
-
-        fig_col3, fig_col4 = st.columns(2)
         with fig_col3:
             if len(medicaid_numeric):
                 fig = px.histogram(x=medicaid_numeric / 1e6, nbins=50, labels={"x": "Medicaid revenue ($M)"}, title="Medicaid revenue distribution")
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No Medicaid revenue data for selected filters.")
-        with fig_col4:
-            if len(margin_numeric):
-                fig = px.histogram(x=margin_numeric, nbins=50, labels={"x": "Net income margin (%)"}, title="Net income margin distribution")
-                st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Pareto charts")
+        pa1, pa2, pa3 = st.columns(3)
+        with pa1:
+            if len(rev_numeric):
+                fig = make_pareto_fig(
+                    pd.to_numeric(filtered[rev_col], errors="coerce").dropna(),
+                    "Revenue",
+                    "Revenue Pareto",
+                    value_scale=1e6,
+                    value_suffix="$M",
+                )
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No net income margin data for selected filters.")
+                st.info("No revenue data for selected filters.")
+        with pa2:
+            if len(medicare_numeric):
+                fig = make_pareto_fig(
+                    pd.to_numeric(filtered[MEDICARE_REV_COL], errors="coerce").dropna(),
+                    "Medicare revenue",
+                    "Medicare revenue Pareto",
+                    value_scale=1e6,
+                    value_suffix="$M",
+                )
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No Medicare revenue data for selected filters.")
+        with pa3:
+            if len(medicaid_numeric):
+                fig = make_pareto_fig(
+                    pd.to_numeric(filtered[MEDICAID_REV_COL], errors="coerce").dropna(),
+                    "Medicaid revenue",
+                    "Medicaid revenue Pareto",
+                    value_scale=1e6,
+                    value_suffix="$M",
+                )
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No Medicaid revenue data for selected filters.")
 
         st.subheader("Home health revenue by state (from providers)")
         map_df = state_revenue_from_providers(providers_raw, year=year, states=states if states else None)
