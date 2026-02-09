@@ -6,9 +6,11 @@ Uses providers_annual.csv and operators_annual.csv.
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 from pathlib import Path
+import zipfile
+import io
+import requests
+import altair as alt
 
 PROJECT_DIR = Path(__file__).resolve().parent
 OPERATORS_PATH = PROJECT_DIR / "operators_annual.csv"
@@ -25,6 +27,18 @@ US_STATES = [
     "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA",
     "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
 ]
+
+# State FIPS codes (numeric) for Altair US states TopoJSON (vega us-10m)
+STATE_TO_FIPS = {
+    "AL": 1, "AK": 2, "AZ": 4, "AR": 5, "CA": 6, "CO": 8, "CT": 9, "DE": 10,
+    "DC": 11, "FL": 12, "GA": 13, "HI": 15, "ID": 16, "IL": 17, "IN": 18, "IA": 19,
+    "KS": 20, "KY": 21, "LA": 22, "ME": 23, "MD": 24, "MA": 25, "MI": 26, "MN": 27,
+    "MS": 28, "MO": 29, "MT": 30, "NE": 31, "NV": 32, "NH": 33, "NJ": 34, "NM": 35,
+    "NY": 36, "NC": 37, "ND": 38, "OH": 39, "OK": 40, "OR": 41, "PA": 42, "RI": 44,
+    "SC": 45, "SD": 46, "TN": 47, "TX": 48, "UT": 49, "VT": 50, "VA": 51, "WA": 53,
+    "WV": 54, "WI": 55, "WY": 56,
+}
+US_10M_URL = "https://cdn.jsdelivr.net/npm/vega-datasets@2/data/us-10m.json"
 
 
 @st.cache_data
@@ -196,6 +210,44 @@ def apply_filters(
     return out
 
 
+ZIP_CENTROID_URL = "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2020_Gazetteer/2020_Gaz_zcta_national.zip"
+ZIP_LAT_LON_PATH = PROJECT_DIR / "zip_lat_lon.csv"
+
+
+def _load_zip_centroids_uncached() -> pd.DataFrame | None:
+    """Load zip code -> (lat, lon). Tries local zip_lat_lon.csv, then Census 2020 ZCTA gazetteer."""
+    if ZIP_LAT_LON_PATH.exists():
+        df = pd.read_csv(ZIP_LAT_LON_PATH)
+        # Normalize column names (allow zip/lat/lon in any case)
+        df = df.rename(columns={c: c.lower() for c in df.columns})
+        if not all(k in df.columns for k in ("zip", "lat", "lon")):
+            return None
+        df["zip"] = df["zip"].astype(str).str.strip().str[:5]
+        df = df.dropna(subset=["lat", "lon"])
+        return df[["zip", "lat", "lon"]].drop_duplicates(subset=["zip"])
+    try:
+        r = requests.get(ZIP_CENTROID_URL, timeout=30)
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            name = [n for n in z.namelist() if n.endswith(".txt")][0]
+            with z.open(name) as f:
+                tab = pd.read_csv(f, sep="\t", dtype=str, on_bad_lines="skip")
+        tab = tab.rename(columns={"GEOID": "zip", "INTPTLAT": "lat", "INTPTLONG": "lon"})
+        tab["zip"] = tab["zip"].str.strip().str[:5]
+        tab["lat"] = pd.to_numeric(tab["lat"], errors="coerce")
+        tab["lon"] = pd.to_numeric(tab["lon"], errors="coerce")
+        tab = tab.dropna(subset=["lat", "lon"])[["zip", "lat", "lon"]].drop_duplicates(subset=["zip"])
+        return tab
+    except Exception:
+        return None
+
+
+@st.cache_data
+def load_zip_centroids(_cache_key: float = 0) -> pd.DataFrame | None:
+    """Load zip code -> (lat, lon). Cache key from local file mtime so cache invalidates when file is added/updated."""
+    return _load_zip_centroids_uncached()
+
+
 def state_revenue_from_providers(providers: pd.DataFrame, year: int, states: list[str] | None) -> pd.DataFrame:
     """State-level revenue from providers_annual only (no double-counting)."""
     rev_col = "Gross Patient Revenues Total"
@@ -222,14 +274,14 @@ def format_currency(x) -> str:
     return f"${x:.2f}"
 
 
-def make_pareto_fig(
+def make_pareto_altair(
     values: pd.Series,
     value_label: str,
     title: str,
     value_scale: float = 1.0,
     value_suffix: str = "",
-) -> go.Figure:
-    """Build a Pareto chart: bars (value, sorted desc) + cumulative % line."""
+):
+    """Build a Pareto chart with Altair: bars (value, sorted desc) + cumulative % line."""
     s = values.dropna()
     s = s[s > 0] if value_scale != 1 else s
     if len(s) == 0:
@@ -237,35 +289,30 @@ def make_pareto_fig(
     s = s.sort_values(ascending=False).reset_index(drop=True)
     s = s / value_scale
     total = s.sum()
-    cum_pct = s.cumsum() / total * 100 if total else s * 0
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=s.index + 1, y=s.values, name=value_label, yaxis="y"))
-    fig.add_trace(
-        go.Scatter(
-            x=s.index + 1,
-            y=cum_pct.values,
-            name="Cumulative %",
-            yaxis="y2",
-            mode="lines+markers",
-            line={"dash": "dash", "color": "firebrick"},
+    cum_pct = (s.cumsum() / total * 100) if total else s * 0
+    df = pd.DataFrame({"rank": s.index + 1, "value": s.values, "cum_pct": cum_pct.values})
+    bar = (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            alt.X("rank:O", title="Rank (by value)"),
+            alt.Y("value:Q", title=f"{value_label} ({value_suffix})"),
         )
     )
-    fig.update_layout(
-        title=title,
-        xaxis_title="Rank (by value)",
-        yaxis=dict(title=f"{value_label} ({value_suffix})", side="left"),
-        yaxis2=dict(
-            title="Cumulative %",
-            side="right",
-            range=[0, 105],
-            overlaying="y",
-            tickformat=".0f",
-        ),
-        hovermode="x unified",
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    line = (
+        alt.Chart(df)
+        .mark_line(color="firebrick", strokeDash=[4, 2])
+        .encode(
+            alt.X("rank:O", title="Rank (by value)"),
+            alt.Y("cum_pct:Q", title="Cumulative %"),
+        )
     )
-    return fig
+    chart = (
+        alt.layer(bar, line)
+        .resolve_scale(y="independent")
+        .properties(title=title)
+    )
+    return chart
 
 
 def main():
@@ -416,23 +463,35 @@ def main():
         medicaid_numeric = pd.to_numeric(filtered["Gross Patient Revenues Title XIX Medicaid"], errors="coerce").dropna()
         medicaid_numeric = medicaid_numeric[medicaid_numeric > 0]
 
+        def _altair_histogram(series, title, x_title, num_bins=50):
+            df = pd.DataFrame({"value": series})
+            return (
+                alt.Chart(df)
+                .mark_bar()
+                .encode(
+                    alt.X("value:Q", bin=alt.Bin(maxbins=num_bins), title=x_title),
+                    alt.Y("count():Q", title="Count"),
+                )
+                .properties(title=title)
+            )
+
         fig_col1, fig_col2, fig_col3 = st.columns(3)
         with fig_col1:
             if len(rev_numeric):
-                fig = px.histogram(x=rev_numeric / 1e6, nbins=50, labels={"x": "Revenue ($M)"}, title="Revenue distribution")
-                st.plotly_chart(fig, use_container_width=True)
+                chart = _altair_histogram(rev_numeric / 1e6, "Revenue distribution", "Revenue ($M)")
+                st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No revenue data for selected filters.")
         with fig_col2:
             if len(medicare_numeric):
-                fig = px.histogram(x=medicare_numeric / 1e6, nbins=50, labels={"x": "Medicare revenue ($M)"}, title="Medicare revenue distribution")
-                st.plotly_chart(fig, use_container_width=True)
+                chart = _altair_histogram(medicare_numeric / 1e6, "Medicare revenue distribution", "Medicare revenue ($M)")
+                st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No Medicare revenue data for selected filters.")
         with fig_col3:
             if len(medicaid_numeric):
-                fig = px.histogram(x=medicaid_numeric / 1e6, nbins=50, labels={"x": "Medicaid revenue ($M)"}, title="Medicaid revenue distribution")
-                st.plotly_chart(fig, use_container_width=True)
+                chart = _altair_histogram(medicaid_numeric / 1e6, "Medicaid revenue distribution", "Medicaid revenue ($M)")
+                st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No Medicaid revenue data for selected filters.")
 
@@ -440,41 +499,41 @@ def main():
         pa1, pa2, pa3 = st.columns(3)
         with pa1:
             if len(rev_numeric):
-                fig = make_pareto_fig(
+                chart = make_pareto_altair(
                     pd.to_numeric(filtered[rev_col], errors="coerce").dropna(),
                     "Revenue",
                     "Revenue Pareto",
                     value_scale=1e6,
                     value_suffix="$M",
                 )
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No revenue data for selected filters.")
         with pa2:
             if len(medicare_numeric):
-                fig = make_pareto_fig(
+                chart = make_pareto_altair(
                     pd.to_numeric(filtered[MEDICARE_REV_COL], errors="coerce").dropna(),
                     "Medicare revenue",
                     "Medicare revenue Pareto",
                     value_scale=1e6,
                     value_suffix="$M",
                 )
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No Medicare revenue data for selected filters.")
         with pa3:
             if len(medicaid_numeric):
-                fig = make_pareto_fig(
+                chart = make_pareto_altair(
                     pd.to_numeric(filtered[MEDICAID_REV_COL], errors="coerce").dropna(),
                     "Medicaid revenue",
                     "Medicaid revenue Pareto",
                     value_scale=1e6,
                     value_suffix="$M",
                 )
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No Medicaid revenue data for selected filters.")
 
@@ -482,20 +541,68 @@ def main():
         map_df = state_revenue_from_providers(providers_raw, year=year, states=states if states else None)
         map_df = map_df.rename(columns={"State Code": "state", "Gross Patient Revenues Total": "revenue"})
         if map_df["revenue"].sum() > 0:
-            fig = px.choropleth(
-                map_df,
-                locations="state",
-                locationmode="USA-states",
-                color="revenue",
-                scope="usa",
-                color_continuous_scale="Blues",
-                title="State-level home health revenue (providers_annual)",
+            map_df = map_df.copy()
+            map_df["id"] = map_df["state"].map(STATE_TO_FIPS)
+            states_topo = alt.topo_feature(US_10M_URL, "states")
+            choro = (
+                alt.Chart(states_topo)
+                .mark_geoshape()
+                .encode(
+                    color=alt.Color("revenue:Q", scale=alt.Scale(scheme="blues"), title="Revenue"),
+                    tooltip=[alt.Tooltip("state:N", title="State"), alt.Tooltip("revenue:Q", title="Revenue", format="$,.0f")],
+                )
+                .transform_lookup(lookup="id", from_=alt.LookupData(map_df, "id", ["revenue", "state"]))
+                .project(type="albersUsa")
+                .properties(width=700, height=500, title="State-level home health revenue (providers_annual)")
             )
-            fig.update_traces(hovertemplate="%{location}<br>Revenue: $%{z:,.0f}<extra></extra>")
-            fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
+            st.altair_chart(choro, use_container_width=True)
         else:
             st.info("No provider revenue data for selected year/filters.")
+
+        st.subheader("Medicare revenue by provider location")
+        _centroid_cache_key = ZIP_LAT_LON_PATH.stat().st_mtime if ZIP_LAT_LON_PATH.exists() else 0.0
+        zip_centroids = load_zip_centroids(_cache_key=_centroid_cache_key)
+        if zip_centroids is not None:
+            prov = providers_raw[providers_raw["year"] == year].copy()
+            if states:
+                prov = prov[prov["State Code"].isin(states)]
+            prov["zip5"] = prov["Zip Code"].astype(str).str.strip().str.replace("-", "").str[:5]
+            prov = prov[prov["zip5"].str.match(r"^\d{5}$", na=False)]
+            prov[MEDICARE_REV_COL] = pd.to_numeric(prov[MEDICARE_REV_COL], errors="coerce").fillna(0)
+            prov = prov[prov[MEDICARE_REV_COL] > 0]
+            prov_map = prov.merge(zip_centroids, left_on="zip5", right_on="zip", how="inner")
+            if not prov_map.empty:
+                prov_map = prov_map.copy()
+                prov_map["medicare_rev"] = pd.to_numeric(prov_map[MEDICARE_REV_COL], errors="coerce").fillna(0)
+                # Size scale: area proportional to revenue; use sqrt for radius
+                prov_map["size"] = np.sqrt(prov_map["medicare_rev"].clip(lower=1))
+                chart_df = prov_map[["lat", "lon", "size", "medicare_rev", "HHA Name", "zip5"]].copy()
+                chart_df["Medicare revenue"] = chart_df["medicare_rev"]  # for tooltip label
+                circle_chart = (
+                    alt.Chart(chart_df)
+                    .mark_circle(opacity=0.6, stroke="white", strokeWidth=0.5)
+                    .encode(
+                        longitude="lon:Q",
+                        latitude="lat:Q",
+                        size=alt.Size("size:Q", scale=alt.Scale(range=[20, 1200]), title="Medicare revenue"),
+                        color=alt.Color("medicare_rev:Q", scale=alt.Scale(scheme="blues"), title="Medicare revenue"),
+                        tooltip=[
+                            alt.Tooltip("HHA Name:N", title="Provider"),
+                            alt.Tooltip("zip5:N", title="ZIP"),
+                            alt.Tooltip("Medicare revenue:Q", format="$,.0f", title="Medicare revenue"),
+                        ],
+                    )
+                    .project(type="albersUsa")
+                    .properties(width=700, height=500, title="Revenue by provider CCN ZIP")
+                )
+                st.altair_chart(circle_chart, use_container_width=True)
+            else:
+                st.info("No providers with Medicare revenue for selected year/filters.")
+        else:
+            st.info(
+                "Map requires zip centroids. Add **zip_lat_lon.csv** (columns: zip, lat, lon) to the project, "
+                "or ensure the app can download the Census 2020 ZCTA gazetteer."
+            )
 
 
 if __name__ == "__main__":
