@@ -457,20 +457,55 @@ def main():
 
         st.subheader("Distributions")
         rev_numeric = pd.to_numeric(filtered[rev_col], errors="coerce").dropna()
-        rev_numeric = rev_numeric[rev_numeric > 0]
+        rev_numeric = rev_numeric[rev_numeric >= 0]
         medicare_numeric = pd.to_numeric(filtered["Gross Patient Revenues Title XVIII Medicare"], errors="coerce").dropna()
-        medicare_numeric = medicare_numeric[medicare_numeric > 0]
+        medicare_numeric = medicare_numeric[medicare_numeric >= 0]
         medicaid_numeric = pd.to_numeric(filtered["Gross Patient Revenues Title XIX Medicaid"], errors="coerce").dropna()
-        medicaid_numeric = medicaid_numeric[medicaid_numeric > 0]
+        medicaid_numeric = medicaid_numeric[medicaid_numeric >= 0]
 
-        def _altair_histogram(series, title, x_title, num_bins=50):
-            df = pd.DataFrame({"value": series})
+        REVENUE_BUCKETS = [
+            "$0",
+            "$0–$100k",
+            "$100k–$500k",
+            "$500k–$1M",
+            "$1M–$2M",
+            "$2M–$5M",
+            "$5M–$10M",
+            "$10M–$50M",
+            "$50M+",
+        ]
+
+        def _revenue_bucket(value: float) -> str:
+            if value == 0:
+                return "$0"
+            if value <= 100_000:
+                return "$0–$100k"
+            if value <= 500_000:
+                return "$100k–$500k"
+            if value <= 1e6:
+                return "$500k–$1M"
+            if value <= 2e6:
+                return "$1M–$2M"
+            if value <= 5e6:
+                return "$2M–$5M"
+            if value <= 10e6:
+                return "$5M–$10M"
+            if value <= 50e6:
+                return "$10M–$50M"
+            return "$50M+"
+
+        def _altair_revenue_bars(series: pd.Series, title: str) -> alt.Chart | None:
+            if series.empty:
+                return None
+            bucketed = series.map(_revenue_bucket)
+            counts = bucketed.value_counts().reindex(REVENUE_BUCKETS, fill_value=0).reset_index()
+            counts.columns = ["bucket", "count"]
             return (
-                alt.Chart(df)
+                alt.Chart(counts)
                 .mark_bar()
                 .encode(
-                    alt.X("value:Q", bin=alt.Bin(maxbins=num_bins), title=x_title),
-                    alt.Y("count():Q", title="Count"),
+                    alt.X("bucket:N", sort=REVENUE_BUCKETS, title="Revenue"),
+                    alt.Y("count:Q", title="Count of operators"),
                 )
                 .properties(title=title)
             )
@@ -478,20 +513,23 @@ def main():
         fig_col1, fig_col2, fig_col3 = st.columns(3)
         with fig_col1:
             if len(rev_numeric):
-                chart = _altair_histogram(rev_numeric / 1e6, "Revenue distribution", "Revenue ($M)")
-                st.altair_chart(chart, use_container_width=True)
+                chart = _altair_revenue_bars(rev_numeric, "Revenue distribution")
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No revenue data for selected filters.")
         with fig_col2:
             if len(medicare_numeric):
-                chart = _altair_histogram(medicare_numeric / 1e6, "Medicare revenue distribution", "Medicare revenue ($M)")
-                st.altair_chart(chart, use_container_width=True)
+                chart = _altair_revenue_bars(medicare_numeric, "Medicare revenue distribution")
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No Medicare revenue data for selected filters.")
         with fig_col3:
             if len(medicaid_numeric):
-                chart = _altair_histogram(medicaid_numeric / 1e6, "Medicaid revenue distribution", "Medicaid revenue ($M)")
-                st.altair_chart(chart, use_container_width=True)
+                chart = _altair_revenue_bars(medicaid_numeric, "Medicaid revenue distribution")
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("No Medicaid revenue data for selected filters.")
 
