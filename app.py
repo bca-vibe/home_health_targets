@@ -16,9 +16,23 @@ PROJECT_DIR = Path(__file__).resolve().parent
 OPERATORS_PATH = PROJECT_DIR / "operators_annual.csv"
 PROVIDERS_PATH = PROJECT_DIR / "providers_annual.csv"
 
-# Type of Control: 3,4,5,6 = For-profit; 1,2 = Non-profit; else Other
-FOR_PROFIT_CODES = {"3", "4", "5", "6"}
-NONPROFIT_CODES = {"1", "2"}
+# CMS Type of Control codes (HHA/cost report standard). Source: CMS cost report instructions.
+TOC_CODE_TO_LABEL = {
+    "1": "Voluntary Nonprofit-Church",
+    "2": "Voluntary Nonprofit-Other",
+    "3": "Proprietary-Individual",
+    "4": "Proprietary-Corporation",
+    "5": "Proprietary-Partnership",
+    "6": "Proprietary-Other",
+    "7": "Governmental-Federal",
+    "8": "Governmental-City-County",
+    "9": "Governmental-County",
+    "10": "Governmental-State",
+    "11": "Governmental-Hospital District",
+    "12": "Governmental-City",
+    "13": "Governmental-Other",
+}
+ORDERED_OWNERSHIP_LABELS = list(TOC_CODE_TO_LABEL.values())
 
 # All US state abbreviations for choropleth (include DC)
 US_STATES = [
@@ -63,15 +77,11 @@ def _normalize_toc_code(toc) -> str:
 
 
 def _ownership_label(toc: str) -> str:
-    """Map CMS Type of Control code to For-profit / Non-profit / Other (government/other)."""
+    """Map CMS Type of Control code to detailed ownership label (or 'Other' for unknown/blank)."""
     code = _normalize_toc_code(toc)
     if not code:
         return "Other"
-    if code in FOR_PROFIT_CODES:
-        return "For-profit"
-    if code in NONPROFIT_CODES:
-        return "Non-profit"
-    return "Other"
+    return TOC_CODE_TO_LABEL.get(code, "Other")
 
 
 MEDICARE_REV_COL = "Gross Patient Revenues Title XVIII Medicare"
@@ -138,7 +148,7 @@ def build_enriched_operators(
     )
 
     # Ownership from providers: mode of Type of Control per (operator_id, year)
-    # Normalize codes (e.g. 5.0 -> "5") so mapping to For-profit/Non-profit works
+    # Map to detailed CMS label (e.g. Proprietary-Corporation, Governmental-State)
     prov = providers[["operator_id", "year", "Type of Control"]].copy()
     prov["toc_code"] = prov["Type of Control"].map(_normalize_toc_code)
     prov = prov[prov["toc_code"] != ""]  # drop blank so mode is meaningful
@@ -344,7 +354,8 @@ def main():
     )
     states = st.sidebar.multiselect("State (operator has at least one CCN in)", all_states, default=[])
 
-    ownership_options = ["For-profit", "Non-profit", "Other"]
+    # Ordered: nonprofit, proprietary, governmental; plus Other for unknown/blank
+    ownership_options = ORDERED_OWNERSHIP_LABELS + ["Other"]
     ownerships = st.sidebar.multiselect("Ownership", ownership_options, default=[])
 
     name_filter = st.sidebar.text_input("Name (operator name contains)", placeholder="e.g. BAYADA")
