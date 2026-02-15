@@ -12,6 +12,7 @@ from collections import defaultdict
 
 PROJECT_DIR = Path(__file__).resolve().parent
 YEARS = (2020, 2021, 2022, 2023)
+CBSA_ZIP_CROSSWALK_PATH = PROJECT_DIR / "cbsa_zip_crosswalk.csv"
 
 # Columns to include in providers_annual (identity, location, ownership, fiscal, volume, cost, revenue, income, balance sheet)
 PROVIDER_COLUMNS = [
@@ -94,6 +95,37 @@ def safe_float(val, default=None):
         return default
 
 
+def normalize_zip(zip_val) -> str:
+    """Normalize to 5-digit string for crosswalk lookup."""
+    if zip_val is None:
+        return ""
+    s = re.sub(r"\D", "", str(zip_val).strip())
+    return s[:5].zfill(5) if len(s) >= 5 else ""
+
+
+def load_zip_to_cbsa(path: Path) -> dict[str, str]:
+    """Load cbsa_zip_crosswalk; return dict zip_5char -> cbsa (str). For ZIPs in multiple CBSAs, keep the one with max TOT_RATIO."""
+    if not path.exists():
+        return {}
+    zip_best: dict[str, tuple[float, str]] = {}  # zip -> (tot_ratio, cbsa)
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            zip_s = normalize_zip(row.get("ZIP"))
+            if not zip_s:
+                continue
+            cbsa = (row.get("CBSA") or "").strip()
+            if not cbsa:
+                continue
+            try:
+                tot = float((row.get("TOT_RATIO") or "0").strip())
+            except (ValueError, TypeError):
+                tot = 0.0
+            if zip_s not in zip_best or tot > zip_best[zip_s][0]:
+                zip_best[zip_s] = (tot, cbsa)
+    return {z: cbsa for z, (_, cbsa) in zip_best.items()}
+
+
 def load_year(path: Path) -> tuple[list[str], list[dict]]:
     """Return (headers, list of row dicts)."""
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
@@ -122,12 +154,17 @@ def main():
                 next_operator_id += 1
         all_rows_by_year[year] = rows
 
-    # 2) Build providers_annual: one row per (CCN, year) with selected columns + operator_id, year
-    provider_headers = ["year", "operator_id"] + [c for c in PROVIDER_COLUMNS if c != "HHA Name"]
-    # Keep HHA Name in output; add after operator_id
-    provider_headers = ["year", "operator_id", "HHA Name"] + [
-        c for c in PROVIDER_COLUMNS if c != "HHA Name"
-    ]
+    # Load ZIP -> CBSA crosswalk for provider/operator CBSA
+    zip_to_cbsa = load_zip_to_cbsa(CBSA_ZIP_CROSSWALK_PATH)
+
+    # 2) Build providers_annual: one row per (CCN, year) with selected columns + operator_id, year, cbsa_cd
+    provider_headers = ["year", "operator_id", "HHA Name"]
+    for c in PROVIDER_COLUMNS:
+        if c == "HHA Name":
+            continue
+        provider_headers.append(c)
+        if c == "Zip Code":
+            provider_headers.append("cbsa_cd")
     provider_out_path = PROJECT_DIR / "providers_annual.csv"
 
     with open(provider_out_path, "w", newline="", encoding="utf-8") as f:
@@ -145,6 +182,7 @@ def main():
                 for col in PROVIDER_COLUMNS:
                     if col in row:
                         out[col] = row[col]
+                out["cbsa_cd"] = zip_to_cbsa.get(normalize_zip(row.get("Zip Code")), "")
                 w.writerow(out)
 
     print(f"Wrote {provider_out_path} with {sum(len(all_rows_by_year[y]) for y in YEARS)} rows")
@@ -186,12 +224,14 @@ def main():
         "n_ccns",
         "n_states",
         "state_codes",
+        "cbsa_codes",
     ] + sum_cols
 
     agg_by_key: dict[tuple[int, int], dict] = defaultdict(lambda: {k: 0.0 for k in sum_cols})
     names_by_key: dict[tuple[int, int], list[str]] = defaultdict(list)
     ccns_by_key: dict[tuple[int, int], set] = defaultdict(set)
     states_by_key: dict[tuple[int, int], set] = defaultdict(set)
+    cbsas_by_key: dict[tuple[int, int], set] = defaultdict(set)
 
     for year in YEARS:
         for row in all_rows_by_year[year]:
@@ -206,6 +246,9 @@ def main():
             state = (row.get("State Code") or "").strip()
             if state:
                 states_by_key[key].add(state)
+            cbsa = zip_to_cbsa.get(normalize_zip(row.get("Zip Code")), "")
+            if cbsa:
+                cbsas_by_key[key].add(cbsa)
             for col in sum_cols:
                 val = safe_float(row.get(col), 0)
                 if val is not None:
@@ -220,6 +263,7 @@ def main():
             operator_name = max(set(names), key=names.count) if names else ""
             ccns = ccns_by_key.get((year, operator_id), set())
             states = sorted(states_by_key.get((year, operator_id), set()))
+            cbsas = sorted(cbsas_by_key.get((year, operator_id), set()))
             row = {
                 "year": year,
                 "operator_id": operator_id,
@@ -227,6 +271,7 @@ def main():
                 "n_ccns": len(ccns),
                 "n_states": len(states),
                 "state_codes": "|".join(states) if states else "",
+                "cbsa_codes": "|".join(cbsas) if cbsas else "",
             }
             for col in sum_cols:
                 row[col] = sums.get(col, 0)

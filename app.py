@@ -15,6 +15,7 @@ import altair as alt
 PROJECT_DIR = Path(__file__).resolve().parent
 OPERATORS_PATH = PROJECT_DIR / "operators_annual.csv"
 PROVIDERS_PATH = PROJECT_DIR / "providers_annual.csv"
+METRO_METRICS_PATH = PROJECT_DIR / "metro_metrics.csv"
 
 # CMS Type of Control codes (HHA/cost report standard). Source: CMS cost report instructions.
 TOC_CODE_TO_LABEL = {
@@ -65,6 +66,14 @@ def load_providers() -> pd.DataFrame:
     return pd.read_csv(PROVIDERS_PATH)
 
 
+@st.cache_data
+def load_metro_metrics(_cache_key: float = 0) -> pd.DataFrame | None:
+    """Load metro_metrics.csv (from metro_fragmentation_metrics notebook). Returns None if missing. Cache invalidates when file mtime changes."""
+    if not METRO_METRICS_PATH.exists():
+        return None
+    return pd.read_csv(METRO_METRICS_PATH)
+
+
 def _normalize_toc_code(toc) -> str:
     """Normalize Type of Control to integer string (e.g. 5.0 -> '5') for consistent mapping."""
     if not pd.notna(toc) or str(toc).strip() in ("", "nan", "NaN"):
@@ -84,10 +93,13 @@ def _ownership_label(toc: str) -> str:
     return TOC_CODE_TO_LABEL.get(code, "Other")
 
 
-MEDICARE_REV_COL = "Gross Patient Revenues Title XVIII Medicare"
+# Use net patient revenue for total and by-payer display/filtering
+MEDICARE_REV_COL = "Net Patient Revenues (line 1 minus line 2) XVIII Medicare"
 MEDICARE_NET_REV_COL = "Net Patient Revenues (line 1 minus line 2) XVIII Medicare"
-MEDICAID_REV_COL = "Gross Patient Revenues Title XIX Medicaid"
+MEDICARE_GROSS_REV_COL = "Gross Patient Revenues Title XVIII Medicare"  # used only for margin denominator
+MEDICAID_REV_COL = "Net Patient Revenues (line 1 minus line 2) XIX Medicaid"
 MEDICAID_NET_REV_COL = "Net Patient Revenues (line 1 minus line 2) XIX Medicaid"
+REV_COL_TOTAL = "Net Patient Revenues (line 1 minus line 2) Total"
 
 
 @st.cache_data
@@ -96,10 +108,10 @@ def build_enriched_operators(
     providers: pd.DataFrame,
 ) -> pd.DataFrame:
     """Add revenue_growth_pct, net_income_margin_pct, medicare_revenue_growth_pct, medicare_net_income_margin_pct, ownership."""
-    rev_col = "Gross Patient Revenues Total"
+    rev_col = REV_COL_TOTAL
     ni_col = "Net Income or Loss for the period (line 18 plus line 32)"
 
-    # Prior-year revenue (total)
+    # Prior-year revenue (total, net)
     prior = operators[["operator_id", "year", rev_col]].copy()
     prior["year"] = prior["year"] + 1
     prior = prior.rename(columns={rev_col: "prior_year_revenue"})
@@ -139,12 +151,13 @@ def build_enriched_operators(
         op.loc[rev_pos, ni_col] / op.loc[rev_pos, rev_col] * 100
     )
 
-    # Medicare net income margin
+    # Medicare net income margin: net Medicare revenue as % of gross (when gross available)
     op[MEDICARE_NET_REV_COL] = pd.to_numeric(op[MEDICARE_NET_REV_COL], errors="coerce")
     op["medicare_net_income_margin_pct"] = None
-    med_rev_pos = op[MEDICARE_REV_COL].notna() & (op[MEDICARE_REV_COL] > 0)
+    med_gross = pd.to_numeric(op[MEDICARE_GROSS_REV_COL], errors="coerce") if MEDICARE_GROSS_REV_COL in op.columns else op[MEDICARE_REV_COL]
+    med_rev_pos = med_gross.notna() & (med_gross > 0)
     op.loc[med_rev_pos, "medicare_net_income_margin_pct"] = (
-        op.loc[med_rev_pos, MEDICARE_NET_REV_COL] / op.loc[med_rev_pos, MEDICARE_REV_COL] * 100
+        op.loc[med_rev_pos, MEDICARE_NET_REV_COL] / med_gross.loc[med_rev_pos] * 100
     )
 
     # Ownership from providers: mode of Type of Control per (operator_id, year)
@@ -181,7 +194,7 @@ def apply_filters(
     zip_substring: str | None = None,
     providers: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    rev_col = "Gross Patient Revenues Total"
+    rev_col = REV_COL_TOTAL
     ni_col = "Net Income or Loss for the period (line 18 plus line 32)"
 
     out = df[df["year"] == year].copy()
@@ -260,7 +273,7 @@ def load_zip_centroids(_cache_key: float = 0) -> pd.DataFrame | None:
 
 def state_revenue_from_providers(providers: pd.DataFrame, year: int, states: list[str] | None) -> pd.DataFrame:
     """State-level revenue from providers_annual only (no double-counting)."""
-    rev_col = "Gross Patient Revenues Total"
+    rev_col = REV_COL_TOTAL
     df = providers[providers["year"] == year].copy()
     df[rev_col] = pd.to_numeric(df[rev_col], errors="coerce").fillna(0)
     if states:
@@ -362,7 +375,7 @@ def main():
     city_filter = st.sidebar.text_input("City (operator has a site in city containing)", placeholder="e.g. Miami")
     zip_filter = st.sidebar.text_input("Zip code (operator has a site in zip containing)", placeholder="e.g. 330")
 
-    rev_col = "Gross Patient Revenues Total"
+    rev_col = REV_COL_TOTAL
     revenue_min = st.sidebar.number_input("Revenue min ($)", min_value=0, value=None, step=100000, format="%d")
     revenue_max = st.sidebar.number_input("Revenue max ($)", min_value=0, value=None, step=100000, format="%d")
 
@@ -390,7 +403,7 @@ def main():
         providers=providers_raw,
     )
 
-    tab1, tab2 = st.tabs(["Operators", "Dashboard"])
+    tab1, tab2, tab3 = st.tabs(["Operators", "Aggregate Metrics", "Metro metrics"])
 
     with tab1:
         st.subheader("Operators table")
@@ -417,7 +430,6 @@ def main():
             "net_income_margin_pct",
             "revenue_growth_pct",
             MEDICARE_REV_COL,
-            MEDICARE_NET_REV_COL,
             "medicare_net_income_margin_pct",
             "medicare_revenue_growth_pct",
         ]
@@ -428,7 +440,6 @@ def main():
             "ownership": "Type of control",
             rev_col: "Total revenue",
             MEDICARE_REV_COL: "Medicare revenue",
-            MEDICARE_NET_REV_COL: "Medicare net income",
             "medicare_net_income_margin_pct": "Medicare net income margin (%)",
             "medicare_revenue_growth_pct": "Medicare revenue growth (%)",
             ni_col: "Net income",
@@ -469,9 +480,9 @@ def main():
         st.subheader("Distributions")
         rev_numeric = pd.to_numeric(filtered[rev_col], errors="coerce").dropna()
         rev_numeric = rev_numeric[rev_numeric >= 0]
-        medicare_numeric = pd.to_numeric(filtered["Gross Patient Revenues Title XVIII Medicare"], errors="coerce").dropna()
+        medicare_numeric = pd.to_numeric(filtered[MEDICARE_REV_COL], errors="coerce").dropna()
         medicare_numeric = medicare_numeric[medicare_numeric >= 0]
-        medicaid_numeric = pd.to_numeric(filtered["Gross Patient Revenues Title XIX Medicaid"], errors="coerce").dropna()
+        medicaid_numeric = pd.to_numeric(filtered[MEDICAID_REV_COL], errors="coerce").dropna()
         medicaid_numeric = medicaid_numeric[medicaid_numeric >= 0]
 
         REVENUE_BUCKETS = [
@@ -588,7 +599,7 @@ def main():
 
         st.subheader("Home health revenue by state (from providers)")
         map_df = state_revenue_from_providers(providers_raw, year=year, states=states if states else None)
-        map_df = map_df.rename(columns={"State Code": "state", "Gross Patient Revenues Total": "revenue"})
+        map_df = map_df.rename(columns={"State Code": "state", REV_COL_TOTAL: "revenue"})
         if map_df["revenue"].sum() > 0:
             map_df = map_df.copy()
             map_df["id"] = map_df["state"].map(STATE_TO_FIPS)
@@ -652,6 +663,114 @@ def main():
                 "Map requires zip centroids. Add **zip_lat_lon.csv** (columns: zip, lat, lon) to the project, "
                 "or ensure the app can download the Census 2020 ZCTA gazetteer."
             )
+
+    with tab3:
+        st.subheader("Metro metrics")
+        with st.expander("Methodology"):
+            st.markdown("""
+            **Data sources.** Metro-level metrics are built by joining the CMS POS file (Q4 2025, home health providers only) 
+            with the 2023 HHA cost report on CCN. Metros are defined by CBSA code from the POS file; CBSA and metro division 
+            names come from the Census CBSA list.
+
+            **Revenue.** All revenue figures use **net patient revenue** (after allowances and discounts) from the cost report, 
+            not gross. Agency size buckets (e.g. 1M–5M, 5M–10M) are based on each agency’s net revenue.
+
+            **Metrics.**
+            - **Consolidated markets:** Metros where the top two agencies account for more than 50% of metro revenue 
+            (*pct_revenue_top2* > 50%).
+            - **Acquisition target segment:** Agencies with net revenue between $1M and $5M.
+            - **Fragmented metros:** Metros where *pct_revenue_top2* < 50%.
+            - **Ownership change:** Agencies with a change of ownership (CHOW) in the last 5 years, from the POS *chow_dt* field.
+
+            **Top 100 table.** Metros are limited to those with a valid CBSA name (Census lookup). The table shows the top 100 
+            **fragmented** metros (pct_revenue_top2 < 50%) ranked by revenue in the 1M–5M segment (*revenue_1M_5M*). Revenue 
+            columns are in dollars; percentage columns are 0–100%.
+            """)
+        metro_df = load_metro_metrics(METRO_METRICS_PATH.stat().st_mtime if METRO_METRICS_PATH.exists() else 0)
+        if metro_df is None or metro_df.empty:
+            st.info(
+                "Run the **metro_fragmentation_metrics** notebook to generate metro_metrics.csv, "
+                "then reload this app."
+            )
+        else:
+            # Ensure numeric columns (pct columns are 0-1)
+            metro_df = metro_df.copy()
+            metro_df["total_revenue"] = pd.to_numeric(metro_df["total_revenue"], errors="coerce").fillna(0)
+            # Total revenue from agencies 1M-5M: use column if present, else compute from total_revenue * share
+            if "revenue_1M_5M" in metro_df.columns:
+                metro_df["revenue_1M_5M"] = pd.to_numeric(metro_df["revenue_1M_5M"], errors="coerce").fillna(0)
+            else:
+                pct_1m_5m = metro_df["pct_revenue_1m_5m"].fillna(0) if "pct_revenue_1m_5m" in metro_df.columns else (metro_df["pct_revenue_1M_2M"].fillna(0) + metro_df["pct_revenue_2M_5M"].fillna(0)) if "pct_revenue_1M_2M" in metro_df.columns and "pct_revenue_2M_5M" in metro_df.columns else 0
+                metro_df["revenue_1M_5M"] = metro_df["total_revenue"] * pct_1m_5m
+            if "revenue_5M_10M" in metro_df.columns:
+                metro_df["revenue_5M_10M"] = pd.to_numeric(metro_df["revenue_5M_10M"], errors="coerce").fillna(0)
+            else:
+                pct_5_10 = metro_df["pct_revenue_5M_10M"].fillna(0) if "pct_revenue_5M_10M" in metro_df.columns else 0
+                metro_df["revenue_5M_10M"] = metro_df["total_revenue"] * pct_5_10
+            if "revenue_10M_50M" in metro_df.columns:
+                metro_df["revenue_10M_50M"] = pd.to_numeric(metro_df["revenue_10M_50M"], errors="coerce").fillna(0)
+            else:
+                pct_10_50 = (metro_df["pct_revenue_10M_20M"].fillna(0) + metro_df["pct_revenue_20M_50M"].fillna(0)) if "pct_revenue_10M_20M" in metro_df.columns and "pct_revenue_20M_50M" in metro_df.columns else 0
+                metro_df["revenue_10M_50M"] = metro_df["total_revenue"] * pct_10_50
+            if "revenue_50M_plus" in metro_df.columns:
+                metro_df["revenue_50M_plus"] = pd.to_numeric(metro_df["revenue_50M_plus"], errors="coerce").fillna(0)
+            else:
+                pct_50_plus = metro_df["pct_revenue_50M_plus"].fillna(0) if "pct_revenue_50M_plus" in metro_df.columns else 0
+                metro_df["revenue_50M_plus"] = metro_df["total_revenue"] * pct_50_plus
+            for col in [
+                "pct_revenue_top2", "pct_revenue_under_1M", "pct_revenue_1m_5m", "pct_revenue_5M_10M", "pct_revenue_10M_20M", "pct_revenue_20M_50M", "pct_revenue_50M_plus",
+                "pct_agencies_ownership_change", "pct_revenue_ownership_change",
+            ]:
+                if col in metro_df.columns:
+                    metro_df[col] = pd.to_numeric(metro_df[col], errors="coerce").fillna(0)
+
+            total_rev = metro_df["total_revenue"].sum()
+            if total_rev > 0:
+                # % of total revenue from consolidated markets (pct_revenue_top2 > 50%)
+                rev_consolidated = metro_df.loc[metro_df["pct_revenue_top2"] > 0.5, "total_revenue"].sum()
+                pct_consolidated = rev_consolidated / total_rev
+
+                # % from acquisition target segment ($1M-$5M agencies)
+                target_share = metro_df["pct_revenue_1m_5m"].fillna(0) if "pct_revenue_1m_5m" in metro_df.columns else (metro_df["pct_revenue_1M_2M"] + metro_df["pct_revenue_2M_5M"]).fillna(0) if "pct_revenue_1M_2M" in metro_df.columns and "pct_revenue_2M_5M" in metro_df.columns else pd.Series(0, index=metro_df.index)
+                rev_target = (metro_df["total_revenue"] * target_share).sum()
+                pct_target = rev_target / total_rev
+
+                # % from acquisition target in fragmented metros (pct_revenue_top2 < 50%)
+                fragmented = metro_df["pct_revenue_top2"] < 0.5
+                rev_target_fragmented = (metro_df["total_revenue"] * target_share).loc[fragmented].sum()
+                pct_target_fragmented = rev_target_fragmented / total_rev
+
+                # % from agencies with ownership change in last 5 years
+                rev_chow = (metro_df["total_revenue"] * metro_df["pct_revenue_ownership_change"].fillna(0)).sum()
+                pct_chow = rev_chow / total_rev
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("% of revenue from consolidated markets (top-2 > 50%)", f"{pct_consolidated:.1%}")
+                m2.metric("% of revenue from acquisition target (1M-5M)", f"{pct_target:.1%}")
+                m3.metric("% of revenue from target segment in fragmented metros", f"{pct_target_fragmented:.1%}")
+                m4.metric("% of revenue from agencies with ownership change (5 yr)", f"{pct_chow:.1%}")
+            else:
+                st.info("No metro revenue in metro_metrics.")
+
+            st.subheader("Top 100 metros to pursue (fragmented, by revenue 1M-5M)")
+            fragmented_metros = metro_df[metro_df["pct_revenue_top2"] < 0.5].copy()
+            rank_col = "revenue_1M_5M" if "revenue_1M_5M" in fragmented_metros.columns else "total_revenue"
+            top100 = fragmented_metros.nlargest(100, rank_col)
+            # Drop metros without a name (e.g. 999xx census placeholders)
+            if "cbsa_name" in top100.columns:
+                top100 = top100[top100["cbsa_name"].notna() & (top100["cbsa_name"].astype(str).str.strip() != "") & (top100["cbsa_name"].astype(str).str.lower() != "none")]
+            if top100.empty:
+                st.info("No fragmented metros (pct_revenue_top2 < 50%) in the data.")
+            else:
+                # Table: only these columns (in order)
+                display_cols = ["cbsa_cd", "cbsa_name", "state", "n_agencies", "total_revenue", "n_agencies_1m_to_5m", "revenue_1M_5M", "revenue_5M_10M", "revenue_10M_50M", "revenue_50M_plus", "pct_revenue_top2", "pct_revenue_50M_plus"]
+                table_df = top100[[c for c in display_cols if c in top100.columns]].copy()
+                format_map = {c: "${:,.0f}" for c in ("total_revenue", "revenue_1M_5M", "revenue_5M_10M", "revenue_10M_50M", "revenue_50M_plus") if c in table_df.columns}
+                format_map.update({c: "{:.1%}" for c in ("pct_revenue_top2", "pct_revenue_50M_plus") if c in table_df.columns})
+                if format_map:
+                    st.dataframe(table_df.style.format(format_map), use_container_width=True, hide_index=True)
+                else:
+                    st.dataframe(table_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
