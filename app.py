@@ -178,6 +178,64 @@ def build_enriched_operators(
     return op
 
 
+@st.cache_data
+def build_enriched_providers(providers: pd.DataFrame) -> pd.DataFrame:
+    """Add revenue_growth_pct, net_income_margin_pct, medicare_revenue_growth_pct, medicare_net_income_margin_pct, ownership (per provider/year)."""
+    rev_col = REV_COL_TOTAL
+    ni_col = "Net Income or Loss for the period (line 18 plus line 32)"
+    ccn_col = "Provider CCN"
+
+    prior = providers[[ccn_col, "year", rev_col]].copy()
+    prior["year"] = prior["year"] + 1
+    prior = prior.rename(columns={rev_col: "prior_year_revenue"})
+    prov = providers.merge(prior, on=[ccn_col, "year"], how="left")
+    prov["prior_year_revenue"] = pd.to_numeric(prov["prior_year_revenue"], errors="coerce")
+    prov[rev_col] = pd.to_numeric(prov[rev_col], errors="coerce")
+    prov["revenue_growth_pct"] = None
+    mask = prov["prior_year_revenue"].notna() & (prov["prior_year_revenue"] > 0)
+    prov.loc[mask, "revenue_growth_pct"] = (
+        (prov.loc[mask, rev_col] - prov.loc[mask, "prior_year_revenue"])
+        / prov.loc[mask, "prior_year_revenue"] * 100
+    )
+    prov = prov.drop(columns=["prior_year_revenue"])
+
+    prior_med = providers[[ccn_col, "year", MEDICARE_REV_COL]].copy()
+    prior_med["year"] = prior_med["year"] + 1
+    prior_med = prior_med.rename(columns={MEDICARE_REV_COL: "prior_medicare_revenue"})
+    prov = prov.merge(prior_med, on=[ccn_col, "year"], how="left")
+    prov["prior_medicare_revenue"] = pd.to_numeric(prov["prior_medicare_revenue"], errors="coerce")
+    prov[MEDICARE_REV_COL] = pd.to_numeric(prov[MEDICARE_REV_COL], errors="coerce")
+    prov["medicare_revenue_growth_pct"] = None
+    mask_med = prov["prior_medicare_revenue"].notna() & (prov["prior_medicare_revenue"] > 0)
+    prov.loc[mask_med, "medicare_revenue_growth_pct"] = (
+        (prov.loc[mask_med, MEDICARE_REV_COL] - prov.loc[mask_med, "prior_medicare_revenue"])
+        / prov.loc[mask_med, "prior_medicare_revenue"] * 100
+    )
+    prov = prov.drop(columns=["prior_medicare_revenue"])
+
+    prov[ni_col] = pd.to_numeric(prov[ni_col], errors="coerce")
+    prov["net_income_margin_pct"] = None
+    rev_pos = prov[rev_col].notna() & (prov[rev_col] > 0)
+    prov.loc[rev_pos, "net_income_margin_pct"] = (
+        prov.loc[rev_pos, ni_col] / prov.loc[rev_pos, rev_col] * 100
+    )
+
+    prov[MEDICARE_NET_REV_COL] = pd.to_numeric(prov[MEDICARE_NET_REV_COL], errors="coerce")
+    prov["medicare_net_income_margin_pct"] = None
+    med_gross = pd.to_numeric(prov[MEDICARE_GROSS_REV_COL], errors="coerce") if MEDICARE_GROSS_REV_COL in prov.columns else prov[MEDICARE_REV_COL]
+    med_rev_pos = med_gross.notna() & (med_gross > 0)
+    prov.loc[med_rev_pos, "medicare_net_income_margin_pct"] = (
+        prov.loc[med_rev_pos, MEDICARE_NET_REV_COL] / med_gross.loc[med_rev_pos] * 100
+    )
+
+    prov["toc_code"] = prov["Type of Control"].map(_normalize_toc_code)
+    prov["ownership"] = prov["toc_code"].map(_ownership_label)
+    prov["ownership"] = prov["ownership"].fillna("Other")
+    prov = prov.drop(columns=["toc_code"], errors="ignore")
+
+    return prov
+
+
 def apply_filters(
     df: pd.DataFrame,
     year: int,
@@ -352,6 +410,7 @@ def main():
     operators_raw = load_operators()
     providers_raw = load_providers()
     enriched = build_enriched_operators(operators_raw, providers_raw)
+    enriched_providers = build_enriched_providers(providers_raw)
 
     # Sidebar filters
     st.sidebar.header("Filters")
@@ -403,7 +462,7 @@ def main():
         providers=providers_raw,
     )
 
-    tab1, tab2, tab3 = st.tabs(["Operators", "Aggregate Metrics", "Metro metrics"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Operators", "Providers", "Aggregate Metrics", "Metro metrics"])
 
     with tab1:
         st.subheader("Operators table")
@@ -450,6 +509,87 @@ def main():
         st.dataframe(table_df, use_container_width=True, hide_index=True)
 
     with tab2:
+        st.subheader("Providers table")
+        rev_col = REV_COL_TOTAL
+        ni_col = "Net Income or Loss for the period (line 18 plus line 32)"
+        prov_filtered = enriched_providers[enriched_providers["year"] == year].copy()
+        if states:
+            prov_filtered = prov_filtered[prov_filtered["State Code"].isin(states)]
+        if revenue_min is not None:
+            prov_filtered = prov_filtered[pd.to_numeric(prov_filtered[rev_col], errors="coerce") >= revenue_min]
+        if revenue_max is not None:
+            prov_filtered = prov_filtered[pd.to_numeric(prov_filtered[rev_col], errors="coerce") <= revenue_max]
+        if net_income_min is not None:
+            prov_filtered = prov_filtered[pd.to_numeric(prov_filtered[ni_col], errors="coerce") >= net_income_min]
+        if net_income_max is not None:
+            prov_filtered = prov_filtered[pd.to_numeric(prov_filtered[ni_col], errors="coerce") <= net_income_max]
+        if margin_min is not None:
+            prov_filtered = prov_filtered[prov_filtered["net_income_margin_pct"].notna() & (prov_filtered["net_income_margin_pct"] >= margin_min)]
+        if margin_max is not None:
+            prov_filtered = prov_filtered[prov_filtered["net_income_margin_pct"].notna() & (prov_filtered["net_income_margin_pct"] <= margin_max)]
+        if ownerships:
+            prov_filtered = prov_filtered[prov_filtered["ownership"].isin(ownerships)]
+        if name_filter and name_filter.strip():
+            prov_filtered = prov_filtered[
+                prov_filtered["HHA Name"].astype(str).str.contains(name_filter.strip(), case=False, na=False)
+            ]
+        if city_filter and city_filter.strip():
+            prov_filtered = prov_filtered[
+                prov_filtered["City"].astype(str).str.contains(city_filter.strip(), case=False, na=False)
+            ]
+        if zip_filter and zip_filter.strip():
+            prov_filtered = prov_filtered[
+                prov_filtered["Zip Code"].astype(str).str.contains(zip_filter.strip(), case=False, na=False)
+            ]
+        # CBSA name lookup from metro_metrics
+        metro_df = load_metro_metrics(METRO_METRICS_PATH.stat().st_mtime if METRO_METRICS_PATH.exists() else 0)
+        if metro_df is not None and not metro_df.empty and "cbsa_cd" in metro_df.columns and "cbsa_name" in metro_df.columns:
+            cbsa_lookup = metro_df[["cbsa_cd", "cbsa_name"]].drop_duplicates(subset=["cbsa_cd"])
+            cbsa_lookup["cbsa_cd"] = cbsa_lookup["cbsa_cd"].astype(str)
+            if "cbsa_cd" in prov_filtered.columns:
+                prov_filtered = prov_filtered.copy()
+                prov_filtered["cbsa_cd"] = prov_filtered["cbsa_cd"].astype(str)
+            prov_filtered = prov_filtered.merge(
+                cbsa_lookup.rename(columns={"cbsa_name": "cbsa_name_lookup"}),
+                left_on="cbsa_cd",
+                right_on="cbsa_cd",
+                how="left",
+            )
+            prov_filtered["cbsa_name"] = prov_filtered["cbsa_name_lookup"]
+            prov_filtered = prov_filtered.drop(columns=["cbsa_name_lookup"], errors="ignore")
+        else:
+            prov_filtered["cbsa_name"] = None
+        prov_display_cols = [
+            "Provider CCN",
+            "HHA Name",
+            "City",
+            "State Code",
+            "cbsa_name",
+            "ownership",
+            rev_col,
+            ni_col,
+            "net_income_margin_pct",
+            "revenue_growth_pct",
+            MEDICARE_REV_COL,
+            "medicare_net_income_margin_pct",
+            "medicare_revenue_growth_pct",
+        ]
+        prov_table = prov_filtered[[c for c in prov_display_cols if c in prov_filtered.columns]].copy()
+        prov_table = prov_table.rename(columns={
+            "State Code": "State",
+            "ownership": "Type of control",
+            rev_col: "Total revenue",
+            MEDICARE_REV_COL: "Medicare revenue",
+            "medicare_net_income_margin_pct": "Medicare net income margin (%)",
+            "medicare_revenue_growth_pct": "Medicare revenue growth (%)",
+            ni_col: "Net income",
+            "net_income_margin_pct": "Net income margin (%)",
+            "revenue_growth_pct": "Revenue growth (%)",
+            "cbsa_name": "CBSA name",
+        })
+        st.dataframe(prov_table, use_container_width=True, hide_index=True)
+
+    with tab3:
         st.subheader("Summary metrics")
         n_op = len(filtered)
         total_rev = pd.to_numeric(filtered[rev_col], errors="coerce").sum()
@@ -664,7 +804,7 @@ def main():
                 "or ensure the app can download the Census 2020 ZCTA gazetteer."
             )
 
-    with tab3:
+    with tab4:
         st.subheader("Metro metrics")
         with st.expander("Methodology"):
             st.markdown("""
